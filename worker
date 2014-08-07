@@ -1,0 +1,206 @@
+<?php
+
+require_once  __DIR__ . '/vendor/autoload.php';
+
+
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Helper\ProgressBar;
+
+use Symfony\Component\Console\Input\InputInterface;
+use Symfony\Component\Console\Input\InputArgument;
+use Symfony\Component\Console\Input\InputOption;
+use Symfony\Component\Console\Output\OutputInterface;
+use PhpAmqpLib\Connection\AMQPConnection;
+use PhpAmqpLib\Message\AMQPMessage;
+use Predis\Client as RedisClient;
+
+	$console = new Application();
+
+	$console
+		->register('starter')
+		->setDefinition(array(
+					new InputArgument('url', InputArgument::REQUIRED, 'url'),
+				     ))
+		->setDescription('Launch the spider process')
+		->setCode(
+			function (InputInterface $input, OutputInterface $output) {
+				$spider = New Spider($output);
+				$url = $input->getArgument('url');
+				$spider->start($url);
+				
+			}
+		);	
+	$console
+		->register('worker')
+		->setDescription('Launch the spider worker')
+		->setCode(
+			function (InputInterface $input, OutputInterface $output) {
+				$spider = New Spider($output);
+				$spider->start(null, true);
+				
+			}
+		);	
+
+
+class Spider {
+
+	protected $exchange = 'urls';
+	protected $queue = 'urls_to_parse';
+	protected $output;
+	protected $ch;
+	protected $amqp_conn_publisher;
+	protected $amqp_conn_consumer;
+	protected $redis;
+
+	public function __construct(OutputInterface $output) {
+
+	$this->amqp_conn_publisher = new AMQPConnection('127.0.0.1', '5672', 'guest', 'guest', '/');
+	$this->amqp_conn_consumer = new AMQPConnection('127.0.0.1', '5672', 'guest', 'guest', '/');
+	$this->output = $output;
+	$this->redis = new Predis\Client();
+	}
+
+	function start($url = null, $worker = false) {
+		$this->ch = $this->amqp_conn_publisher->channel();
+		$this->ch->queue_declare($this->queue, false, true, false, false);
+		$this->ch->exchange_declare($this->exchange, 'direct', false, true, false);
+		$this->ch->queue_bind($this->queue, $this->exchange);
+		$this->output->writeln(sprintf('Starting spider for <info>%s</info>', $url));
+		if(!$worker) {
+			$this->redis->del('s0');
+			$this->redis->del('s1');
+			$this->redis->del('s2');
+			$this->collect_urls($url, $url);
+		} else {
+			$chc = $this->amqp_conn_consumer->channel();
+			$chc->basic_consume($this->queue, 'consumer', false, false, false, false, array($this, 'process_message'));
+			while (count($chc->callbacks)) {
+				$chc->wait();
+			}
+		}
+	}
+
+
+
+
+	public function publish($urls, $parent) {
+	//	$progress = new ProgressBar($this->output, sizeof($urls));
+	//	$progress->start();
+		$i = 0;
+		while ($i++ < sizeof($urls)) {
+			$msg_body = json_encode(array('url' => $urls[$i-1], 'parent' => $parent));
+			$msg = new AMQPMessage($msg_body, array('content_type' => 'text/plain', 'delivery_mode' => 2));
+			if(!$this->redis->sismember('s0', $urls[$i-1])) {
+				$this->ch->basic_publish($msg, $this->exchange);
+			}
+			// advance the progress bar 1 unit
+	//		$progress->advance();
+
+		}
+	//	$progress->finish();
+
+	}
+
+	public function process_message($msg) {
+		$job = json_decode($msg->body, true);
+		try{
+		$this->collect_urls($job['url'], $job['parent']);
+		} catch(\Exception $e) {
+			
+		} 
+		$msg->delivery_info['channel']->basic_ack($msg->delivery_info['delivery_tag']);
+	}
+
+
+	public function collect_urls($start_url, $parent) {
+		$http = curl_init($start_url);
+		curl_setopt($http, CURLOPT_RETURNTRANSFER, TRUE);
+		$result = curl_exec($http);
+		$http_status = curl_getinfo($http, CURLINFO_HTTP_CODE);
+		curl_close($http);
+		$this->redis->sadd('s0', $start_url);
+		if(preg_match('/.*\.lexpress\.fr/', $parent) || preg_match('/.*\.cotemaison\.fr/', $parent)  || preg_match('/videos\.lexpress\.fr/', $parent) || preg_match('/.*\.lentreprise\.com/', $parent) || preg_match('/.*\.lexpansion\.com/', $parent) || preg_match('/.*\.lexpress\.fr/', $parent) || preg_match('/.*\.lalettredelexpansion\.com/', $parent)) {
+			if($http_status >= '500') {
+				$this->output->writeln(sprintf('<error>%s</error> ' . $start_url . ' parent: ' . $parent, $http_status));
+				$this->redis->sadd('s2', json_encode(array('url' => $start_url, 'parent' => $parent, 'status_code' => $http_status)));
+			} elseif($http_status != '200' && $http_status != '301' && $http_status != '302' ) {
+				$this->redis->sadd('s2', json_encode(array('url' => $start_url, 'parent' => $parent, 'status_code' => $http_status)));
+				$this->output->writeln(sprintf('<comment>%s</comment> ' . $start_url . ' parent: ' . $parent , $http_status));
+			}
+			//$html = file_get_contents($start_url);
+			$dom = new DOMDocument();
+			@$dom->loadHTML($result);
+
+			// grab all the on the page
+			$xpath = new DOMXPath($dom);
+
+
+			$jobs = array(
+					array(
+						'pattern' => "/html/body//a",
+						'attribute' => 'href'
+					     ),
+					array(
+						'pattern' => "/html//script",
+						'attribute' => 'src'
+					     ),
+					array(
+						'pattern' => "/html//link",
+						'attribute' => 'href'
+					     ),
+
+
+				     );
+
+			$urls_to_test = array();
+			foreach($jobs as $job) {
+				$hrefs = $xpath->evaluate($job['pattern']);
+				for ($i = 0; $i < $hrefs->length; $i++) {
+					$href = $hrefs->item($i);
+					$url = $href->getAttribute($job['attribute']);
+					$url = trim($url);
+					if(preg_match('/^\#.*/', $url)) {
+						continue;
+					}
+					if($url == "") {
+						continue;
+					}
+					if(preg_match('/^mailto.*/', $url)) {
+						continue;
+					}
+					if(preg_match('/^\/{1}[a-zA-Z0-9]{1,}.*/',$url)) {
+				//		$this->output->writeln('>>> ' . $url);
+						$parsed_url = parse_url($start_url);
+						$url = $parsed_url['scheme'] . '://'  . rtrim($parsed_url['host'], '/') . '/' . ltrim($url, '/');
+					}
+					if(!preg_match('/^\/.*/',$url) && !preg_match('/^http[s]{0,1}:\/\//', $url) && !preg_match('/^\/\//', $url)) {
+				//		$this->output->writeln('> ' . $url);
+						$url = rtrim($start_url, '/') . '/' . ltrim($url, '/');
+				}
+				if(preg_match('/^\/\//', $url)) {
+					$url = 'http:' . $url;
+				}
+				if($url == '/') {
+					$url = $start_url;
+				}
+
+				if(preg_match('/.*\.lexpress\.fr/', $url) || preg_match('/.*\.cotemaison\.fr/', $url)  || preg_match('/videos\.lexpress\.fr/', $url) || preg_match('/.*\.lentreprise\.com/', $url) || preg_match('/.*\.lexpansion\.com/', $url) || preg_match('/.*\.lexpress\.fr/', $url) || preg_match('/.*\.lalettredelexpansion\.com/', $url)) {
+					if(!in_array($url, $urls_to_test)) {
+						if(!$this->redis->sismember('s1', $url)) {
+							array_push($urls_to_test, $url);
+							$this->redis->sadd('s1', $url);	
+						}
+					}
+				}
+
+
+				}
+
+			}
+			$this->publish($urls_to_test, $start_url);
+		}
+
+	}
+}
+$console->run();
+

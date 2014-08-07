@@ -1,0 +1,7 @@
+{
+    "require": {
+        "symfony/console": "2.6.*@dev",
+        "videlalvaro/php-amqplib": "2.4.*@dev",
+        "predis/predis": "1.1.*@dev"
+    }
+}
